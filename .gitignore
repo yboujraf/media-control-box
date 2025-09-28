@@ -1,5 +1,6 @@
- Never commit secrets
+# Never commit secrets
 /env/*.local.env
+/env/*.env
 
 # Certs & private keys
 *.pem

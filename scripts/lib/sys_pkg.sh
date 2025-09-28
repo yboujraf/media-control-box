@@ -14,7 +14,8 @@ apt_update_once() {
   fi
 }
 
-ensure_pkgs() {
+# New canonical name
+ensure_packages() {
   local pkgs=("$@")
   (( ${#pkgs[@]} )) || return 0
   apt_update_once
@@ -22,7 +23,12 @@ ensure_pkgs() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
 }
 
-ensure_docker_runtime() {
+# Backward-compat aliases (some old scripts may call these)
+ensure_pkgs() { ensure_packages "$@"; }
+ensure_pkg()  { ensure_packages "$@"; }
+
+# New canonical name
+ensure_docker() {
   if command -v docker >/dev/null 2>&1; then
     info "docker present: $(docker --version | awk '{print $3}')"
     return 0
@@ -32,3 +38,6 @@ ensure_docker_runtime() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
   systemctl enable --now docker
 }
+
+# Backward-compat alias
+ensure_docker_runtime() { ensure_docker; }

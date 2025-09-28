@@ -33,6 +33,16 @@ env_load() {
   done
 }
 
+# --- load a single env file if it exists (exporting vars) ---
+load_env_file() {
+  local f="${1:-}"
+  [[ -z "$f" || ! -f "$f" ]] && return 0
+  set -a
+  # shellcheck disable=SC1090
+  . "$f"
+  set +a
+}
+
 # --- validation ------------------------------------------------------------
 require_vars() {
   local missing=0 v
@@ -46,6 +56,17 @@ require_cmd() {
   local miss=0 c
   for c in "$@"; do command -v "$c" >/dev/null 2>&1 || { err "Missing command: $c"; miss=1; }; done
   (( miss == 0 )) || exit 1
+}
+
+# --- boolean validation ----------------------------------------------------
+require_bools() {
+  local v
+  for v in "$@"; do
+    if [[ -n "${!v-}" && "${!v}" != "true" && "${!v}" != "false" ]]; then
+      echo "[!] $v must be 'true' or 'false' (got: '${!v}')" >&2
+      exit 1
+    fi
+  done
 }
 
 # --- files & hashing -------------------------------------------------------
