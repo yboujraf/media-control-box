@@ -1,44 +1,63 @@
-SERVICE_NAME="grafana"
 #!/usr/bin/env bash
 set -euo pipefail
-# SERVICE_NAME will be injected by sed below
-
-# Load shared libs
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/core.sh"
-env_load "$SERVICE_NAME"
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/sys_pkg.sh"
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/docker.sh"
+env_load "grafana"
 
-# Optional: pick libs you need; they can be safely sourced even if unused
-. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/dns_cf.sh"      || true
-. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/cert_cf.sh"     || true
-. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/sys_pkg.sh"     || true
-. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/docker.sh"      || true
-. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/net.sh"         || true
+SERVICE="grafana"
+IMG="${GRAFANA_DOCKER_IMAGE:-grafana/grafana-oss:latest}"
+PORT="${GRAFANA_HTTP_PORT:-3000}"
+DATA_DIR="${GRAFANA_DATA_DIR:-./var/state/grafana/data}"
+LOG_DIR="${GRAFANA_LOG_DIR:-./var/logs/grafana}"
+PROV_DIR="${GRAFANA_PROVISIONING_DIR:-./var/state/grafana/provisioning}"
+CONF_DIR="${GRAFANA_CONFIG_DIR:-./var/state/grafana/config}"
 
-log_file="$(today_log_path "$SERVICE_NAME")"
-logln(){ printf "%s\n" "$*" | tee -a "$log_file"; }
+# 1) base packages & docker
+info "Install base packages"
+ensure_packages ca-certificates curl jq gnupg apt-transport-https openssl
 
-cmd="$(basename "$0")"
+info "Ensure docker runtime"
+ensure_docker_runtime
 
-case "$cmd" in
-  plan.sh)
-    logln "PLAN: $SERVICE_NAME — describe what would change (no side-effects)"
-    # Example: validate required env here (no secrets printed)
-    # require_vars EXAMPLE_VAR
-    ;;
-  apply.sh)
-    logln "APPLY: $SERVICE_NAME — performing idempotent changes"
-    # Example scaffold:
-    # if is_dry_run; then logln "DRY-RUN: would do X"; exit 0; fi
-    # ... do work with libs ...
-    ;;
-  remove.sh)
-    logln "REMOVE: $SERVICE_NAME — stopping/removing only this service's artifacts"
-    # ... stop containers, remove firewall rules owned by this service (idempotent) ...
-    ;;
-  status.sh)
-    logln "STATUS: $SERVICE_NAME — quick health summary"
-    # ... show ports, container status, version, endpoints ...
-    ;;
-  *)
-    err "Unknown command"; exit 1;;
-esac
+# 2) dirs with UID 472
+install -d -m 0755 "$DATA_DIR" "$LOG_DIR" "$PROV_DIR" "$CONF_DIR"
+chown -R 472:472 "$DATA_DIR" "$LOG_DIR" "$PROV_DIR" || true
+
+# 3) grafana.ini binds loopback only (reverse proxy terminates TLS)
+write_if_changed "${CONF_DIR}/grafana.ini" <<CFG
+[server]
+http_addr = 127.0.0.1
+http_port = ${PORT}
+domain = ${GRAFANA_DOMAIN:-localhost}
+root_url = %(protocol)s://%(domain)s/
+serve_from_sub_path = false
+
+[paths]
+data = /var/lib/grafana
+logs = /var/log/grafana
+plugins = /var/lib/grafana/plugins
+provisioning = /etc/grafana/provisioning
+
+[users]
+default_theme = system
+
+[auth.anonymous]
+enabled = false
+CFG
+
+# 4) container spec & run
+SPEC="$(printf '%s' \
+  "${IMG}|${PORT}|${DATA_DIR}|${LOG_DIR}|${PROV_DIR}|${CONF_DIR}"
+)"
+HASH="$(printf "%s" "$SPEC" | sha256sum | awk '{print $1}')"
+
+docker_run_or_replace "grafana" "grafana" "$IMG" "$HASH" -- \
+  -p "127.0.0.1:${PORT}:3000" \
+  -v "${DATA_DIR}:/var/lib/grafana" \
+  -v "${LOG_DIR}:/var/log/grafana" \
+  -v "${PROV_DIR}:/etc/grafana/provisioning" \
+  -v "${CONF_DIR}/grafana.ini:/etc/grafana/grafana.ini:ro"
+
+info "Grafana status"
+docker ps --filter name=grafana --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
