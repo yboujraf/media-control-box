@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# === pre-commit hook ===
+# Prevent committing secrets into tracked env files
+
+set -euo pipefail
+
+FOUND_SECRETS=0
+
+# Scan only staged .env (not *.local.env)
+for file in $(git diff --cached --name-only | grep -E '^env/.*\.env$' | grep -v '\.local\.env$'); do
+  if git show :"$file" | grep -E -i '(_TOKEN=|_SECRET=|_API_KEY=|PASSWORD=|BEGIN PRIVATE KEY)' \
+    | grep -v 'CHANGEME' >/dev/null; then
+    echo "[BLOCKED] Potential secret found in $file"
+    FOUND_SECRETS=1
+  fi
+done
+
+if [[ $FOUND_SECRETS -eq 1 ]]; then
+  echo "❌ Commit rejected. Use placeholders (e.g. CHANGEME) in tracked env files."
+  echo "✅ Put real values into *.local.env, which are git-ignored."
+  exit 1
+fi
+
+exit 0

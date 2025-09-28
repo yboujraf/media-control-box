@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MSG_FILE="$1"
+MSG=$(head -n1 "$MSG_FILE")
+
+# Allow merges and reverts
+if echo "$MSG" | grep -Eq '^(Merge|Revert)'; then
+  exit 0
+fi
+
+# Conventional Commits: type(scope)?: subject
+if echo "$MSG" | grep -Eq '^(feat|fix|docs|chore|refactor|perf|test|build|ci)(\([a-z0-9._-]+\))?(!)?: .{1,}'; then
+  exit 0
+fi
+
+cat <<HELP
+[BLOCKED] Commit message must follow Conventional Commits, e.g.:
+  feat(turn): add healthcheck to container
+  fix(cert): set privkey to 0600
+  docs(readme): add quick start
+  chore(ci): enable shellcheck
+
+Format: type(scope)?: subject
+
+Allowed types: feat, fix, docs, chore, refactor, perf, test, build, ci
+HELP
+exit 1

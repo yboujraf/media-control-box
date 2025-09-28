@@ -1,0 +1,24 @@
+ Never commit secrets
+/env/*.local.env
+
+# Certs & private keys
+*.pem
+*.key
+*.p12
+*.ini
+.secrets/
+/secrets/
+
+# State & runtime (kept local)
+/var/logs/
+/var/state/
+
+# Editors/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Never commit .old
+
+*.bak
+*.old

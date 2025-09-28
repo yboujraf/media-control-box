@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# If commitizen is installed, check recent commits format
+if command -v cz >/dev/null 2>&1; then
+  # Try to check all commits to be pushed; fall back to HEAD if unknown
+  RANGE="${LOCAL_COMMIT_RANGE:-}"
+  if [[ -z "${RANGE}" ]]; then
+    # determine upstream if available
+    UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
+    if [[ -n "$UPSTREAM" ]]; then
+      RANGE="$(git merge-base HEAD "$UPSTREAM")..HEAD"
+    else
+      RANGE="HEAD~10..HEAD"
+    fi
+  fi
+  echo "[*] Commitizen check for range: $RANGE"
+  cz check --rev-range "$RANGE" || {
+    echo "[BLOCKED] Commit messages failed conventional check. Use: cz commit"
+    exit 1
+  }
+fi
+
+exit 0
