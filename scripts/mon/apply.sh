@@ -1,177 +1,111 @@
 #!/usr/bin/env bash
-# Apply Grafana (Monitoring) — idempotent
-# Requires libs: core.sh, sys_pkg.sh, docker.sh
+# apply.sh — MON (Grafana) install/upgrade (localhost-only bind)
 set -euo pipefail
 
-# --- locate repo root and libs ---
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# shellcheck source=/dev/null
-source "$ROOT/scripts/lib/core.sh"
-# shellcheck source=/dev/null
-source "$ROOT/scripts/lib/sys_pkg.sh"
-# shellcheck source=/dev/null
-source "$ROOT/scripts/lib/docker.sh"
+SERVICE_NAME="mon"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-# Optional CF DNS & Cert libs (only used if present + env set)
-DNS_LIB="$ROOT/scripts/lib/dns_cf.sh"
-CERT_LIB="$ROOT/scripts/lib/cert_cf.sh"
-[[ -f "$DNS_LIB"  ]] && source "$DNS_LIB"  || true
-[[ -f "$CERT_LIB" ]] && source "$CERT_LIB" || true
+# libs
+. "$ROOT/scripts/lib/core.sh"
+. "$ROOT/scripts/lib/sys_pkg.sh"      || true
+. "$ROOT/scripts/lib/docker.sh"       || true
+. "$ROOT/scripts/lib/dns_cf.sh"       || true  # optional, we skip DNS here
+. "$ROOT/scripts/lib/cert_cf.sh"      || true  # optional, nginx will own TLS
 
-env_load mon
+env_load "$SERVICE_NAME"
 
-# ---- config from env (mon.env / global.env) -------------------------------
-# Required for container run
-: "${MON_DOMAIN:=grafana.local}"             # FQDN for Grafana (public vhost)
-: "${MON_HTTP_ADDR:=127.0.0.1}"              # bind inside container
-: "${MON_HTTP_PORT:=3000}"                   # internal port
-: "${MON_EXPOSE_ADDR:=127.0.0.1}"            # host bind (stay local until nginx-proxy)
-: "${MON_EXPOSE_PORT:=3000}"                 # host port
+log_file="$(today_log_path "$SERVICE_NAME")"
+log(){ printf "[+] %s\n" "$*" | tee -a "$log_file"; }
+info(){ printf "[*] %s\n" "$*" | tee -a "$log_file"; }
+warn(){ printf "[!] %s\n" "$*" | tee -a "$log_file"; }
 
-# Optional Cloudflare + cert
-: "${CF_ZONE:=}"                              # Cloudflare zone (e.g. example.com)
-: "${CF_API_TOKEN:=}"                         # Cloudflare token
-: "${CF_PROPAGATION_SECONDS:=30}"             # DNS-01 wait
-: "${SYS_ADMIN_EMAIL:=}"                      # Certbot registration email
-: "${CERT_ECDSA:=true}"                       # prefer ECDSA
-: "${CERT_WILDCARD_PAIR:=false}"              # not used here, but supported by lib
+# -----------------------------
+# Defaults (override in env/mon*.env if desired)
+# -----------------------------
+GRAFANA_IMAGE="${GRAFANA_IMAGE:-grafana/grafana:latest}"
+GRAFANA_NAME="${GRAFANA_NAME:-grafana}"
+GRAFANA_HTTP_PORT="${GRAFANA_HTTP_PORT:-3000}"   # container port
+GRAFANA_BIND_ADDR="${GRAFANA_BIND_ADDR:-127.0.0.1}"  # host bind (loopback)
+GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER:-admin}"
+GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-admin}"
+GRAFANA_PLUGINS="${GRAFANA_PLUGINS:-grafana-pyroscope-app,grafana-exploretraces-app,grafana-metricsdrilldown-app,grafana-lokiexplore-app}"
 
-# Optional IPs for DNS upsert (fallback auto-detect if missing)
-: "${MON_PUBLIC_IP4:=}"
-: "${MON_PUBLIC_IP6:=}"
+STATE_DIR="$ROOT/var/state/mon"
+DATA_DIR="$STATE_DIR/grafana"           # /var/lib/grafana
+PROV_DIR="$STATE_DIR/provisioning"      # /etc/grafana/provisioning
+CONF_DIR="$STATE_DIR/config"            # /etc/grafana
+CONF_INI="$CONF_DIR/grafana.ini"
+LOG_DIR="$ROOT/var/logs/mon"
 
-# Paths (host)
-DATA_DIR="$ROOT/var/mon/grafana/data"
-PLUGINS_DIR="$ROOT/var/mon/grafana/plugins"
-PROV_DIR="$ROOT/var/mon/grafana/provisioning"
-CONF_DIR="$ROOT/etc/mon/grafana"
-CONF_FILE="$CONF_DIR/grafana.ini"
+# run uid/gid (Grafana default 472)
+GF_UID="${GF_UID:-472}"
+GF_GID="${GF_GID:-472}"
 
-# Container
-IMAGE="grafana/grafana:latest"
-NAME="grafana"
+log "Install base packages"
+ensure_packages ca-certificates curl jq gnupg apt-transport-https openssl
 
-# --- helpers ---------------------------------------------------------------
-detect_public_ips() {
-  [[ -n "$MON_PUBLIC_IP4" ]] || MON_PUBLIC_IP4="$(curl -4 -fsS https://ifconfig.co 2>/dev/null || true)"
-  [[ -n "$MON_PUBLIC_IP6" ]] || MON_PUBLIC_IP6="$(curl -6 -fsS https://ifconfig.co 2>/dev/null || true)"
-}
+log "Ensure docker runtime"
+ensure_docker_runtime
 
-ensure_base_dirs() {
-  install -d -m 0755 "$ROOT/var/mon/grafana" "$CONF_DIR"
-  install -d -m 0755 "$DATA_DIR" "$PLUGINS_DIR" "$PROV_DIR"
-  # Grafana runs as uid:gid 472:472 — make data/provisioning owned by it
-  if is_dry_run; then
-    info "DRY-RUN chown -R 472:472 $DATA_DIR $PLUGINS_DIR $PROV_DIR"
-  else
-    chown -R 472:472 "$DATA_DIR" "$PLUGINS_DIR" "$PROV_DIR"
-    chmod -R u+rwX,go-rwx "$DATA_DIR" "$PLUGINS_DIR" "$PROV_DIR"
-  fi
+# DNS/cert are handled later by nginx-proxy; we explicitly *skip* here.
+if [[ -z "${CF_API_TOKEN:-}" || -z "${CF_ZONE:-}" || -z "${MON_DOMAIN:-}" ]]; then
+  warn "dns_cf/cert_cf skipped (nginx-proxy will own DNS/TLS for ${MON_DOMAIN:-<unset>})"
+fi
 
-  # Minimal config if missing (readable by container)
-  if [[ ! -f "$CONF_FILE" ]]; then
-    cat <<'INI' | write_if_changed "$CONF_FILE" 0644 >/dev/null
+# Dirs & config
+mkdir -p "$DATA_DIR" "$PROV_DIR" "$CONF_DIR" "$LOG_DIR"
+if ! is_dry_run; then
+  chown -R "$GF_UID:$GF_GID" "$DATA_DIR" "$PROV_DIR" || true
+  chmod -R u+rwX,go-rwx "$DATA_DIR" "$PROV_DIR" || true
+fi
+
+# Minimal grafana.ini (keep defaults; you can extend later)
+write_if_changed "$CONF_INI" <<'INI'
 [server]
-# container listens on this address/port
-http_addr = 127.0.0.1
+# Protocol stays http behind nginx, we bind to localhost only
+protocol = http
 http_port = 3000
 
 [security]
-# default admin creds (change after first login or set via env)
-admin_user = admin
-admin_password = admin
+# Harden later if desired
+cookie_secure = false
+allow_embedding = false
+
+[users]
+default_theme = dark
 INI
-    # ensure ownership (root-readable is fine)
-    if ! is_dry_run; then chown root:root "$CONF_FILE"; chmod 0644 "$CONF_FILE"; fi
-  fi
-}
 
-dns_upsert_if_possible() {
-  # only if lib loaded and token provided and MON_DOMAIN != default
-  if declare -F cf_dns_upsert >/dev/null && [[ -n "$CF_API_TOKEN" && -n "$CF_ZONE" ]]; then
-    info "Cloudflare zone resolve attempt"
-    cf_zone_id_find "$CF_ZONE" >/dev/null
+# Build a stable spec hash for idempotency
+spec_hash="$(sha_spec \
+  "$GRAFANA_IMAGE" \
+  "$GRAFANA_NAME" \
+  "$GRAFANA_BIND_ADDR:$GRAFANA_HTTP_PORT:$GRAFANA_HTTP_PORT" \
+  "$GF_UID:$GF_GID" \
+  "$(stat -c '%Y' "$CONF_INI" 2>/dev/null || echo 0)" \
+)"
 
-    detect_public_ips
-    if [[ -n "$MON_PUBLIC_IP4" ]]; then
-      cf_dns_upsert "$MON_DOMAIN" "A"   "$MON_PUBLIC_IP4" "false"
-    else
-      warn "No IPv4 detected for DNS upsert"
-    fi
-    if [[ -n "$MON_PUBLIC_IP6" ]]; then
-      cf_dns_upsert "$MON_DOMAIN" "AAAA" "$MON_PUBLIC_IP6" "false"
-    else
-      info "No IPv6 detected (skip AAAA)"
-    fi
-  else
-    warn "dns_cf.sh not sourced or CF vars not set; skipping DNS upsert for $MON_DOMAIN"
-  fi
-}
+log "Pulling $GRAFANA_IMAGE"
+docker_pull_if_needed "$GRAFANA_IMAGE"
 
-cert_issue_if_possible() {
-  if declare -F le_prepare >/dev/null && declare -F le_issue_if_needed >/dev/null && [[ -n "$CF_API_TOKEN" && -n "$SYS_ADMIN_EMAIL" ]]; then
-    le_prepare
-    le_issue_if_needed "$MON_DOMAIN" "$CF_PROPAGATION_SECONDS"
-  else
-    warn "cert_cf.sh not sourced or CF_API_TOKEN missing; skipping cert issuance for $MON_DOMAIN"
-  fi
-}
+log "Recreating container $GRAFANA_NAME"
 
-run_container() {
-  docker_pull_if_needed "$IMAGE"
+# IMPORTANT: publish ONLY on 127.0.0.1 (no public exposure)
+docker_run_or_replace "mon" "$GRAFANA_NAME" "$GRAFANA_IMAGE" "$spec_hash" -- \
+  -p "${GRAFANA_BIND_ADDR}:${GRAFANA_HTTP_PORT}:${GRAFANA_HTTP_PORT}/tcp" \
+  -e "GF_SECURITY_ADMIN_USER=$GRAFANA_ADMIN_USER" \
+  -e "GF_SECURITY_ADMIN_PASSWORD=$GRAFANA_ADMIN_PASSWORD" \
+  -e "GF_INSTALL_PLUGINS=$GRAFANA_PLUGINS" \
+  -v "$DATA_DIR:/var/lib/grafana" \
+  -v "$PROV_DIR:/etc/grafana/provisioning" \
+  -v "$CONF_DIR:/etc/grafana" \
+  --health-cmd='curl -fsS http://127.0.0.1:3000/api/health || exit 1' \
+  --health-start-period=30s \
+  --health-interval=15s \
+  --health-retries=10 \
+  -- \
+  grafana server
 
-  # docker run options (volumes, ports, env)
-  local dr_opts=()
-  dr_opts+=( -p "${MON_EXPOSE_ADDR}:${MON_EXPOSE_PORT}:${MON_HTTP_PORT}" )
-  dr_opts+=( -v "${CONF_FILE}:/etc/grafana/grafana.ini:ro" )
-  dr_opts+=( -v "${DATA_DIR}:/var/lib/grafana" )
-  dr_opts+=( -v "${PLUGINS_DIR}:/var/lib/grafana/plugins" )
-  dr_opts+=( -v "${PROV_DIR}:/etc/grafana/provisioning" )
-  dr_opts+=( -e "GF_SERVER_HTTP_ADDR=${MON_HTTP_ADDR}" )
-  dr_opts+=( -e "GF_SERVER_HTTP_PORT=${MON_HTTP_PORT}" )
-  dr_opts+=( -e "GF_SECURITY_ALLOW_EMBEDDING=true" )
-  dr_opts+=( -e "GF_PATHS_CONFIG=/etc/grafana/grafana.ini" )
-  dr_opts+=( -e "GF_PATHS_DATA=/var/lib/grafana" )
+log "Grafana status"
+docker ps --filter "name=$GRAFANA_NAME" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
 
-  # container command (none; use image default)
-  local container_cmd=()
-
-  # spec hash for idempotence
-  local spec
-  spec="$(sha_spec "$IMAGE|$MON_EXPOSE_ADDR|$MON_EXPOSE_PORT|$MON_HTTP_ADDR|$MON_HTTP_PORT|$CONF_FILE|$DATA_DIR|$PLUGINS_DIR|$PROV_DIR")"
-
-  docker_run_or_replace "mon" "$NAME" "$IMAGE" "$spec" -- "${dr_opts[@]}" -- "${container_cmd[@]}"
-}
-
-show_status() {
-  info "Grafana status"
-  docker ps --filter name="$NAME" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" || true
-  # Quick health ping (works when bound to localhost)
-  if command -v curl >/dev/null 2>&1; then
-    sleep 1
-    if curl -fsS "http://${MON_EXPOSE_ADDR}:${MON_EXPOSE_PORT}/api/health" >/dev/null 2>&1; then
-      info "Grafana /api/health OK at http://${MON_EXPOSE_ADDR}:${MON_EXPOSE_PORT}"
-    else
-      warn "Grafana /api/health not responding yet"
-    fi
-  fi
-}
-
-main() {
-  log "Install base packages"
-  ensure_pkgs ca-certificates curl jq gnupg apt-transport-https openssl
-
-  log "Ensure docker runtime"
-  ensure_docker_runtime
-
-  ensure_base_dirs
-  dns_upsert_if_possible
-  cert_issue_if_possible
-  info "Pulling $IMAGE"
-  docker_pull_if_needed "$IMAGE"
-  run_container
-  show_status
-  log "MON apply complete."
-}
-
-main "$@"
+log "MON apply complete."

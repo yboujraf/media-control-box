@@ -14,6 +14,7 @@ docker_run_or_replace() {
   local svc="${1:?}"; local name="${2:?}"; local image="${3:?}"; local spec_hash="${4:?}"; shift 4
   [[ "$1" == "--" ]] && shift || true
 
+  # Split docker run options vs container command at the first "--"
   local docker_opts=()
   local container_cmd=()
   local saw_sep=0
@@ -63,17 +64,4 @@ docker_is_healthy() {
 docker_logs_tail() {
   local name="${1:?}"; local n="${2:-100}"
   docker logs --tail "$n" "$name" 2>&1 || true
-}
-
-docker_rm_if_exists() {
-  local name="${1:?}"
-  if docker inspect "$name" >/dev/null 2>&1; then
-    is_dry_run && { info "DRY-RUN docker rm -f $name"; return 0; }
-    docker rm -f "$name" >/dev/null 2>&1 || true
-    echo "updated:container:${name}:removed"
-  fi
-}
-
-docker_spec_hash() {
-  sha_spec "$@"
 }

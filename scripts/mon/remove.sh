@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
-# Remove Grafana container (keeps data, DNS, certs)
 set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/../lib/core.sh"
+. "$here/../lib/docker.sh"
+env_load mon
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# shellcheck source=/dev/null
-source "$ROOT/scripts/lib/core.sh"
+KEEP_DATA="${KEEP_DATA:-true}"
 
-NAME="grafana"
+log "MON remove — stopping/removing Grafana container"
+docker_rm_if_exists grafana
 
-log "MON remove — stopping/removing container (data/DNS/certs preserved)"
-if docker inspect "$NAME" >/dev/null 2>&1; then
-  if is_dry_run; then
-    info "DRY-RUN docker rm -f $NAME"
-  else
-    docker rm -f "$NAME" >/dev/null
-    echo "updated:container:${NAME}:removed"
-  fi
+if [[ "$KEEP_DATA" == "false" ]]; then
+  warn "KEEP_DATA=false — purging data/config dirs"
+  for d in "${MON_DATA_DIR:-./var/state/mon/grafana}" \
+           "${MON_PROVISIONING_DIR:-./var/state/mon/provisioning}" \
+           "${MON_CONFIG_DIR:-./var/state/mon/config}"; do
+    [[ -z "$d" ]] && continue
+    is_dry_run && { info "DRY-RUN rm -rf $d"; continue; }
+    rm -rf "$d"
+  done
 else
-  info "Container $NAME not present"
+  info "Keeping data/config dirs (set KEEP_DATA=false to purge)"
 fi
 
-# We intentionally leave:
-# - var/mon/grafana/* (data, plugins, provisioning)
-# - etc/mon/grafana/grafana.ini
-# - Cloudflare DNS records
-# - Let's Encrypt certs
-
-log "Done. (Data and credentials left intact.)"
+log "Done."

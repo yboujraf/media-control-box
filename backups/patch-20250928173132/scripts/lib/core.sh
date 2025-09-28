@@ -12,8 +12,10 @@ err()   { printf "[x] %s\n" "$*" >&2; }
 # --- dry-run flag ----------------------------------------------------------
 is_dry_run() { [[ "${DRY_RUN:-false}" == "true" ]]; }
 
-# --- env loading -----------------------------------------------------------
-# env_load <service> — loads global.env, <svc>.env then *.local.env (unless NO_DOTENV=true)
+# --- env loading (dotenv optional) -----------------------------------------
+# Usage: env_load <service>
+# Loads env/global.env, env/<service>.env then *.local.env unless NO_DOTENV=true.
+# Runtime environment always wins.
 env_load() {
   local svc="${1:-}"
   if [[ "${NO_DOTENV:-false}" == "true" ]]; then
@@ -27,15 +29,18 @@ env_load() {
   [[ -n "$svc" ]] && files+=("$root/env/${svc}.local.env")
   for f in "${files[@]}"; do
     [[ -f "$f" ]] || continue
-    set -a; . "$f"; set +a
+    set -a; source "$f"; set +a
   done
 }
 
-# load a single env file if exists
+# --- load a single env file if it exists (exporting vars) ---
 load_env_file() {
   local f="${1:-}"
   [[ -z "$f" || ! -f "$f" ]] && return 0
-  set -a; . "$f"; set +a
+  set -a
+  # shellcheck disable=SC1090
+  . "$f"
+  set +a
 }
 
 # --- validation ------------------------------------------------------------
@@ -47,23 +52,25 @@ require_vars() {
   (( missing == 0 )) || exit 1
 }
 
-require_bools() {
-  local v
-  for v in "$@"; do
-    if [[ -n "${!v-}" && "${!v}" != "true" && "${!v}" != "false" ]]; then
-      err "$v must be 'true' or 'false' (got: '${!v}')"
-      exit 1
-    fi
-  done
-}
-
 require_cmd() {
   local miss=0 c
   for c in "$@"; do command -v "$c" >/dev/null 2>&1 || { err "Missing command: $c"; miss=1; }; done
   (( miss == 0 )) || exit 1
 }
 
+# --- boolean validation ----------------------------------------------------
+require_bools() {
+  local v
+  for v in "$@"; do
+    if [[ -n "${!v-}" && "${!v}" != "true" && "${!v}" != "false" ]]; then
+      echo "[!] $v must be 'true' or 'false' (got: '${!v}')" >&2
+      exit 1
+    fi
+  done
+}
+
 # --- files & hashing -------------------------------------------------------
+# Writes stdin to dest only if changed; sets mode (default 0644)
 write_if_changed() {
   local dest="$1"; local mode="${2:-0644}"
   local tmp; tmp="$(mktemp)"
@@ -79,7 +86,8 @@ write_if_changed() {
 
 sha_spec() { printf "%s" "$*" | sha256sum | awk '{print $1}'; }
 
-# --- logs & state ----------------------------------------------------------
+# --- logs per service ------------------------------------------------------
+# today_log_path <service> -> echoes path and ensures dir
 today_log_path() {
   local svc="${1:?service required}"
   local root; root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -88,6 +96,7 @@ today_log_path() {
   printf "%s" "$p"
 }
 
+# --- state dir per service -------------------------------------------------
 state_dir() {
   local svc="${1:?service required}"
   local root; root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
