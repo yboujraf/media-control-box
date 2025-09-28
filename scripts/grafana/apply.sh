@@ -1,131 +1,144 @@
 #!/usr/bin/env bash
+# scripts/grafana/apply.sh — idempotent Grafana deploy
 set -euo pipefail
+
+# libs
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/core.sh"
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/sys_pkg.sh"
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/docker.sh"
 
+SERVICE_NAME="grafana"
+log_file="$(today_log_path "$SERVICE_NAME")"
+log(){ printf "%s\n" "$*" | tee -a "$log_file"; }
+
+# load env (global + grafana + *.local.env)
 env_load "grafana"
 
-# Defaults
-GRAFANA_ENABLE="${GRAFANA_ENABLE:-true}"
-GRAFANA_DOMAIN="${GRAFANA_DOMAIN:-localhost}"
-GRAFANA_LISTEN_HOST="${GRAFANA_LISTEN_HOST:-127.0.0.1}"
-GRAFANA_HTTP_PORT="${GRAFANA_HTTP_PORT:-3000}"
-GRAFANA_DOCKER_IMAGE="${GRAFANA_DOCKER_IMAGE:-grafana/grafana-oss:latest}"
-GRAFANA_UID="${GRAFANA_UID:-472}"
-GRAFANA_GID="${GRAFANA_GID:-472}"
-GRAFANA_DATA_DIR="${GRAFANA_DATA_DIR:-./var/state/grafana/data}"
-GRAFANA_LOG_DIR="${GRAFANA_LOG_DIR:-./var/state/grafana/logs}"
-GRAFANA_PROVISIONING_DIR="${GRAFANA_PROVISIONING_DIR:-./var/state/grafana/provisioning}"
-GRAFANA_CONFIG_DIR="${GRAFANA_CONFIG_DIR:-./var/state/grafana/config}"
-GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER:-admin}"
-GRAFANA_ADMIN_PASS="${GRAFANA_ADMIN_PASS:-admin}"
-NAME="grafana"
+# --------------------
+# defaults (safe fallbacks)
+# --------------------
+: "${GRAFANA_ENABLE:=true}"
+: "${GRAFANA_DOMAIN:=}"
+: "${GRAFANA_DOCKER_IMAGE:=grafana/grafana-oss:latest}"
 
+# container listen (inside container) — keep 0.0.0.0 unless you really need to restrict
+: "${GRAFANA_LISTEN_HOST:=0.0.0.0}"
+# host publish (outside container) — set to 127.0.0.1 to keep it private behind nginx
+: "${GRAFANA_PUBLISH_HOST:=127.0.0.1}"
+: "${GRAFANA_HTTP_PORT:=3000}"
+
+: "${GRAFANA_UID:=472}"
+: "${GRAFANA_GID:=472}"
+
+# paths
+: "${GRAFANA_DATA_DIR:=./var/state/grafana/data}"
+: "${GRAFANA_LOG_DIR:=./var/state/grafana/logs}"
+: "${GRAFANA_PROVISIONING_DIR:=./var/state/grafana/provisioning}"
+: "${GRAFANA_CONFIG_DIR:=./var/state/grafana/config}"
+
+# optional admin (used only if you log in with user/pass; do NOT put real secrets in repo)
+: "${GRAFANA_ADMIN_USER:=admin}"
+: "${GRAFANA_ADMIN_PASS:=CHANGEME}"
+
+# --------------------
+# preflight
+# --------------------
 if [[ "$GRAFANA_ENABLE" != "true" ]]; then
-  warn "GRAFANA_ENABLE is not true; nothing to do."
+  warn "GRAFANA_ENABLE is not 'true' — skipping apply."
   exit 0
 fi
 
-info "Install base packages"
+log "[*] Install base packages"
 ensure_packages ca-certificates curl jq gnupg apt-transport-https openssl
 
-info "Ensure docker runtime"
+log "[*] Ensure docker runtime"
 ensure_docker_runtime
 
-# Ensure dirs and ownership
+# --------------------
+# ensure dirs & ownership
+# --------------------
 for d in "$GRAFANA_DATA_DIR" "$GRAFANA_LOG_DIR" "$GRAFANA_PROVISIONING_DIR" "$GRAFANA_CONFIG_DIR"; do
-  if is_dry_run; then info "DRY-RUN mkdir -p $d"; else install -d -m 0755 "$d"; fi
-  if is_dry_run; then info "DRY-RUN chown ${GRAFANA_UID}:${GRAFANA_GID} $d"; else chown -R "${GRAFANA_UID}:${GRAFANA_GID}" "$d" || true; fi
+  if is_dry_run; then
+    info "DRY-RUN mkdir -p $d && chown ${GRAFANA_UID}:${GRAFANA_GID}"
+  else
+    install -d -m 0755 "$d"
+    chown -R "${GRAFANA_UID}:${GRAFANA_GID}" "$d"
+  fi
 done
 
-# Required provisioning subdirs to silence Grafana errors
-for sd in "datasources" "dashboards" "plugins" "alerting"; do
-  p="${GRAFANA_PROVISIONING_DIR}/${sd}"
-  if is_dry_run; then info "DRY-RUN mkdir -p $p"; else install -d -m 0755 "$p"; fi
-  if is_dry_run; then info "DRY-RUN chown ${GRAFANA_UID}:${GRAFANA_GID} $p"; else chown -R "${GRAFANA_UID}:${GRAFANA_GID}" "$p" || true; fi
+# make provisioning subfolders so Grafana stops warning
+for sd in dashboards datasources alerting plugins; do
+  if is_dry_run; then
+    info "DRY-RUN mkdir -p ${GRAFANA_PROVISIONING_DIR}/${sd}"
+  else
+    install -d -m 0755 "${GRAFANA_PROVISIONING_DIR}/${sd}"
+    chown -R "${GRAFANA_UID}:${GRAFANA_GID}" "${GRAFANA_PROVISIONING_DIR}/${sd}"
+  fi
 done
 
-# Minimal dashboards provider file (so provisioning doesn’t error)
-dash_provider="${GRAFANA_PROVISIONING_DIR}/dashboards/provider.yaml"
-cat <<YAML | write_if_changed "$dash_provider" >/dev/null
-apiVersion: 1
-providers:
-  - name: 'default'
-    orgId: 1
-    folder: ''
-    type: file
-    disableDeletion: true
-    updateIntervalSeconds: 30
-    allowUiUpdates: true
-    options:
-      path: /etc/grafana/provisioning/dashboards
-YAML
-chown "${GRAFANA_UID}:${GRAFANA_GID}" "$dash_provider" || true
-echo "updated:$dash_provider"
-
-# Optional empty datasources file (you can replace later via API or file)
-ds_file="${GRAFANA_PROVISIONING_DIR}/datasources/datasources.yaml"
-if [[ ! -f "$ds_file" ]]; then
-  cat <<'YAML' | write_if_changed "$ds_file" >/dev/null
-apiVersion: 1
-datasources: []
-YAML
-  chown "${GRAFANA_UID}:${GRAFANA_GID}" "$ds_file" || true
-  echo "updated:$ds_file"
-fi
-
-# grafana.ini from env (container paths)
-grafana_ini_path="${GRAFANA_CONFIG_DIR}/grafana.ini"
-cat >"${grafana_ini_path}.tmp" <<INI
+# --------------------
+# grafana.ini (minimal, points to our bind + paths)
+# --------------------
+cfg_path="${GRAFANA_CONFIG_DIR}/grafana.ini"
+cfg_content="$(cat <<EOF
 [server]
-protocol = http
 http_addr = ${GRAFANA_LISTEN_HOST}
-http_port = ${GRAFANA_HTTP_PORT}
+http_port = 3000
 domain = ${GRAFANA_DOMAIN}
-enforce_domain = false
 root_url = %(protocol)s://%(domain)s:%(http_port)s/
+
+[paths]
+data = /var/lib/grafana
+logs = /var/log/grafana
+plugins = /var/lib/grafana/plugins
+provisioning = /etc/grafana/provisioning
+
+[log]
+mode = console file
 
 [security]
 admin_user = ${GRAFANA_ADMIN_USER}
-# Note: admin_password is not persisted here for security; set via env or UI.
+admin_password = ${GRAFANA_ADMIN_PASS}
+EOF
+)"
+printf "%s\n" "$cfg_content" | write_if_changed "$cfg_path" >/dev/null
+# keep ownership
+if ! is_dry_run; then chown "${GRAFANA_UID}:${GRAFANA_GID}" "$cfg_path"; fi
+echo "updated:${cfg_path}"
 
-[paths]
-provisioning = /etc/grafana/provisioning
-data = /var/lib/grafana
-logs = /var/log/grafana
+# --------------------
+# run / replace container
+# --------------------
+log "[*] Pulling ${GRAFANA_DOCKER_IMAGE}"
+docker_pull_if_needed "${GRAFANA_DOCKER_IMAGE}"
 
-[users]
-default_theme = system
-allow_sign_up = false
+# compose a spec hash that changes when config/env changes
+spec_fingerprint="$(
+  printf "%s|" "${GRAFANA_DOCKER_IMAGE}" "${GRAFANA_HTTP_PORT}" "${GRAFANA_LISTEN_HOST}" "${GRAFANA_PUBLISH_HOST}" "${GRAFANA_UID}" "${GRAFANA_GID}"
+  sha_spec "$(cat "$cfg_path" 2>/dev/null || true)"
+)"
+spec_hash="$(sha_spec "$spec_fingerprint")"
 
-[auth]
-disable_login_form = false
-signout_redirect_url =
-INI
-write_if_changed "$grafana_ini_path" < "${grafana_ini_path}.tmp" >/dev/null
-rm -f "${grafana_ini_path}.tmp"
-chown "${GRAFANA_UID}:${GRAFANA_GID}" "$grafana_ini_path" || true
-echo "updated:$grafana_ini_path"
+log "[*] Recreating container grafana (if spec changed)"
+docker_run_or_replace "grafana" "grafana" "${GRAFANA_DOCKER_IMAGE}" "${spec_hash}" -- \
+  -p "${GRAFANA_PUBLISH_HOST}:${GRAFANA_HTTP_PORT}:3000" \
+  -e "GF_SERVER_HTTP_ADDR=${GRAFANA_LISTEN_HOST}" \
+  -e "GF_SERVER_HTTP_PORT=3000" \
+  -e "GF_PATHS_CONFIG=/etc/grafana/grafana.ini" \
+  -v "$(realpath -m "$GRAFANA_CONFIG_DIR"):/etc/grafana" \
+  -v "$(realpath -m "$GRAFANA_PROVISIONING_DIR"):/etc/grafana/provisioning" \
+  -v "$(realpath -m "$GRAFANA_DATA_DIR"):/var/lib/grafana" \
+  -v "$(realpath -m "$GRAFANA_LOG_DIR"):/var/log/grafana"
 
-# Container spec
-image="$GRAFANA_DOCKER_IMAGE"
-ports=(-p "${GRAFANA_LISTEN_HOST}:${GRAFANA_HTTP_PORT}:3000")
-mounts=(
-  -v "$(readlink -f "$GRAFANA_DATA_DIR"):/var/lib/grafana"
-  -v "$(readlink -f "$GRAFANA_LOG_DIR"):/var/log/grafana"
-  -v "$(readlink -f "$GRAFANA_PROVISIONING_DIR"):/etc/grafana/provisioning"
-  -v "$(readlink -f "$GRAFANA_CONFIG_DIR")/grafana.ini:/etc/grafana/grafana.ini:ro"
-)
+# --------------------
+# status
+# --------------------
+log "[*] Grafana status"
+docker ps --filter name=grafana
 
-# Spec hash
-spec="$(printf "%s|%s|%s|%s|%s|%s" "$image" "${ports[*]}" "${mounts[*]}" "$GRAFANA_LISTEN_HOST" "$GRAFANA_HTTP_PORT" "$GRAFANA_DOMAIN")"
-spec_hash="$(sha_spec "$spec")"
-
-# Run or replace
-docker_run_or_replace "grafana" "$NAME" "$image" "$spec_hash" -- \
-  "${ports[@]}" \
-  "${mounts[@]}"
-
-info "Grafana status"
-docker ps --filter name="$NAME" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+# quick local probe
+if command -v curl >/dev/null 2>&1; then
+  echo
+  echo "[*] Local HTTP probe"
+  curl -sSI "http://127.0.0.1:${GRAFANA_HTTP_PORT}" || true
+fi
